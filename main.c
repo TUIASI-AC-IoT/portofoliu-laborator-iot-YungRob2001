@@ -11,37 +11,81 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
+#include "driver/gpio.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_tls.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
-#include "driver/gpio.h"
+
+#include "version.h"
 
 #define CONFIG_ESP_WIFI_SSID      "lab-iot"
 #define CONFIG_ESP_WIFI_PASS      "IoT-IoT-IoT"
 #define CONFIG_ESP_MAXIMUM_RETRY  5
 #define CONFIG_LOCAL_PORT         10001
 
+//TODO: Modificati adresa IP de mai jos pentru a coincide cu cea a PC-ul pe care rulati scriptul python
+#define CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL "https://192.168.89.50:5000/firmware.bin"
+#define CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL "https://192.168.89.50:5000/version" 
+
+#define GPIO_OUTPUT_IO 4
+#define GPIO_OUTPUT_PIN_SEL (1ULL<<GPIO_OUTPUT_IO)
+#define GPIO_INPUT_IO 2
+#define GPIO_INPUT_PIN_SEL (1ULL<<GPIO_INPUT_IO)
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
-
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static const char *TAG = "wifi station";
+static EventGroupHandle_t s_event_start_ota;
+#define BIT_BTN_PRESSED    BIT0
+
+static const char *TAG = "simple_ota_example";
+extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
 static int s_retry_num = 0;
 
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        break;
+    case HTTP_EVENT_ON_DATA:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
+        break;
+    case HTTP_EVENT_REDIRECT:
+        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
+        break;
+    }
+    return ESP_OK;
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -125,75 +169,93 @@ bool wifi_init_sta(void)
     return false;
 }
 
-static void udp_task(void *pvParameters) {
-    char rx_buffer[128];
-    char addr_str[128];
-    int addr_family = 0;
-    int ip_protocol = 0;
+static void ota_task(void *pvParameters)
+{
+    xEventGroupWaitBits(s_event_start_ota, BIT_BTN_PRESSED, pdTRUE, pdTRUE, portMAX_DELAY);
 
-    struct sockaddr_in local_addr = {
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_family = AF_INET,
-        .sin_port = htons(CONFIG_LOCAL_PORT)
+    ESP_LOGI(TAG, "Starting OTA example task");
+    esp_http_client_config_t config = {
+        .url = CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL,
+        .cert_pem = (char *)server_cert_pem_start,
+        .cert_len = 1422,
+        .event_handler = _http_event_handler,
+        .keep_alive_enable = true,
+        .use_global_ca_store = true,
+        .skip_cert_common_name_check = true
     };
-    addr_family = AF_INET;
-    ip_protocol = IPPROTO_IP;
 
-    while(1) {
-        int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-            break;
-        }
-        ESP_LOGI(TAG, "Socket created");
+    esp_https_ota_config_t ota_config = {
+        .http_config = &config,
+    };
+    
+    ESP_ERROR_CHECK(esp_tls_init_global_ca_store());
+    ESP_ERROR_CHECK(esp_tls_set_global_ca_store((unsigned char*)server_cert_pem_start, server_cert_pem_end - server_cert_pem_start));
 
-        int err = bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr));
-        if (err < 0) {
-            ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        }
-        ESP_LOGI(TAG, "Socket bound, port %d", CONFIG_LOCAL_PORT);
-
-        while (1) {
-            struct sockaddr_in source_addr;
-            socklen_t socklen = sizeof(source_addr);
-            int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
-                              (struct sockaddr *)&source_addr, &socklen);
-
-            if (len < 0) {
-                ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
-                break;
-            } else {
-                 
-                inet_ntoa_r(source_addr.sin_addr, addr_str, sizeof(addr_str) - 1);
-                rx_buffer[len] = '\0';
-                ESP_LOGI(TAG, "Received %d bytes from %s: %s", len, addr_str, rx_buffer);
-
-                 
-                int value;
-                if (sscanf(rx_buffer, "GPIO4=%d", &value) == 1) {
-                    if (value == 0 || value == 1) {
-                        gpio_set_level(GPIO_NUM_4, value); 
-                        ESP_LOGI(TAG, "LED set to %s", value ? "ON" : "OFF");
-                    } else {
-                        ESP_LOGW(TAG, "Invalid LED value: %d", value);
-                    }
-                } else {
-                    ESP_LOGW(TAG, "Invalid command format");
-                }
-            }
-            vTaskDelay(200 / portTICK_PERIOD_MS);
-        }
-
-        if (sock != -1) {
-            shutdown(sock, 0);
-            close(sock);
-        }
+    ESP_LOGI(TAG, "Attempting to download update from %s", config.url);
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "OTA Succeed, Rebooting...");
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "Firmware upgrade failed");
     }
-    vTaskDelete(NULL);
+    while (1) {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
 }
 
-void app_main(void) {
-     
+static void button_task(void * pvParameter)
+{
+    uint8_t u8Count = 5;
+    int val = 1;
+
+    while(1)
+    {
+        if (gpio_get_level(GPIO_INPUT_IO) != val)
+            u8Count--;
+        else
+            u8Count = 5;
+
+        if(!u8Count) {
+            val = gpio_get_level(GPIO_INPUT_IO);
+            
+            if(!gpio_get_level(GPIO_INPUT_IO)){
+                ESP_LOGI(TAG, "Button pressed");
+                xEventGroupSetBits(s_event_start_ota, BIT_BTN_PRESSED);
+                val = gpio_get_level(GPIO_INPUT_IO);
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+void gpio_init()
+{
+    //zero-initialize the config structure.
+    gpio_config_t io_conf = {};
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+    //disable pull-down mode
+    io_conf.pull_down_en = 0;
+    //disable pull-up mode
+    io_conf.pull_up_en = 0;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+}
+
+void app_main(void)
+{
+    //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -201,17 +263,14 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-     
+    gpio_init();
+
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     bool connected = wifi_init_sta();
 
     if (connected) {
-      
-        gpio_reset_pin(GPIO_NUM_4);
-        gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
-        ESP_LOGI(TAG, "GPIO4 initialized as output");
-
-         
-        xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
+        s_event_start_ota = xEventGroupCreate();
+        xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, NULL);
+        xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
     }
 }
