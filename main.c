@@ -15,6 +15,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "C:\Users\rachi\Documents\PlatformIO\Projects\DNSLAB\mdns\include\mdns.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -191,9 +192,13 @@ static void udp_task(void *pvParameters) {
     }
     vTaskDelete(NULL);
 }
+void mdns_init_with_name(const char *hostname) {
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set(hostname));
+    ESP_LOGI(TAG, "mDNS hostname set to: %s", hostname);
+}
 
 void app_main(void) {
-     
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -201,17 +206,16 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-     
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     bool connected = wifi_init_sta();
 
     if (connected) {
-      
+        mdns_init_with_name("esp32-Rachiteanu");  
+        
         gpio_reset_pin(GPIO_NUM_4);
         gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
         ESP_LOGI(TAG, "GPIO4 initialized as output");
 
-         
         xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
     }
 }
